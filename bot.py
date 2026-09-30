@@ -117,9 +117,18 @@ def _tb_pick(items: list[dict]) -> tuple[str, str, int]:
     return f["dlink"], f.get("server_filename") or "video.mp4", int(f.get("size") or 0)
 
 
-def _tb_headers(referer: str) -> dict:
+TB_COOKIE_HOSTS = TB_HOSTS + ("1024tera.com", "terabox.app")
+VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts")
+
+
+def _is_tb_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in TB_COOKIE_HOSTS)
+
+
+def _tb_headers(referer: str, cookie: bool = True) -> dict:
     h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*", "Referer": referer}
-    if TB_COOKIE:
+    if TB_COOKIE and cookie:
         h["Cookie"] = f"ndus={TB_COOKIE}"
     return h
 
@@ -147,29 +156,46 @@ async def _tb_builtin(s: aiohttp.ClientSession, url: str) -> tuple[str, str, int
 
 
 def _tb_parse_external(data) -> tuple[str, str, int]:
+    """Understands the 'terabox-downloader-api' shape
+       {"status":"success","data":{"files":[{"filename","size_bytes","dlink","proxy_url"}]}}
+       as well as flat {"download_url"/"dlink": ..., "filename": ...} responses."""
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        if str(data.get("status", "success")).lower() not in ("success", "ok", "true"):
+            raise LookupError("external resolver reported failure")
+        data = data["data"]
     if isinstance(data, dict) and isinstance(data.get("files"), list) and data["files"]:
-        data = data["files"][0]
+        files = data["files"]
+        data = next((f for f in files if isinstance(f, dict)
+                     and str(f.get("filename", "")).lower().endswith(VIDEO_EXT)), files[0])
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
         raise LookupError("bad external response")
-    dl = next((data[k] for k in ("download_url", "download_link", "dlink", "direct_link")
-               if isinstance(data.get(k), str) and data[k]), "")
+    # proxy_url first: the resolver's server attaches the login cookie for us
+    dl = next((data[k] for k in ("proxy_url", "download_url", "download_link", "dlink",
+                                 "direct_link") if isinstance(data.get(k), str) and data[k]), "")
     if not dl:
         raise LookupError("no link in external response")
     name = data.get("filename") or data.get("file_name") or data.get("name") or "video.mp4"
-    try:
-        size = int(data.get("size") or 0)
-    except (TypeError, ValueError):
-        size = 0
+    size = 0
+    for k in ("size_bytes", "size"):
+        try:
+            size = int(data[k])
+            break
+        except (KeyError, TypeError, ValueError):
+            continue
     return dl, name, size
 
 
 async def _tb_external(s: aiohttp.ClientSession, url: str) -> tuple[str, str, int]:
-    """Optional fallback: GET TERABOX_RESOLVER_URL?url=<share> -> JSON with a direct link."""
+    """TERABOX_RESOLVER_URL ending in /download -> POST {"url": share}; otherwise GET ?url=share."""
     headers = {"Authorization": f"Bearer {TB_KEY}"} if TB_KEY else {}
-    async with s.get(TB_URL, params={"url": url}, headers=headers,
-                     timeout=aiohttp.ClientTimeout(total=45)) as r:
+    t = aiohttp.ClientTimeout(total=90)   # free hosts can take ~50s to wake up
+    if urlparse(TB_URL).path.rstrip("/").endswith("/download"):
+        req = s.post(TB_URL, json={"url": url}, headers=headers, timeout=t)
+    else:
+        req = s.get(TB_URL, params={"url": url}, headers=headers, timeout=t)
+    async with req as r:
         if r.status != 200:
             raise LookupError(f"external HTTP {r.status}")
         return _tb_parse_external(await r.json(content_type=None))
@@ -177,30 +203,30 @@ async def _tb_external(s: aiohttp.ClientSession, url: str) -> tuple[str, str, in
 
 async def download_terabox(url: str, out_dir: Path) -> list[dict]:
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600, connect=15)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900, connect=15)) as s:
             resolved = None
-            for resolver in (_tb_builtin, _tb_external if TB_URL else None):
-                if resolver is None:
-                    continue
+            # configured resolver first (most reliable), anonymous lookup as fallback
+            for resolver in ((_tb_external,) if TB_URL else ()) + (_tb_builtin,):
                 try:
                     resolved = await resolver(s, url)
                     break
                 except LookupError as e:
-                    log.info("terabox resolver %s failed: %s", resolver.__name__, e)
+                    log.warning("terabox resolver %s failed: %s", resolver.__name__, e)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    log.info("terabox resolver %s network error: %s", resolver.__name__, e)
+                    log.warning("terabox resolver %s network error: %r", resolver.__name__, e)
             if not resolved:
-                raise UserError("Couldn't get this TeraBox video. The link may be expired, "
-                                "password-protected, or TeraBox is blocking anonymous access.")
+                raise UserError("Couldn't get this TeraBox video. The link may be expired or "
+                                "password-protected, or the resolver is down.")
             dl, name, size = resolved
-            if not dl.startswith("https://"):
-                dl = dl.replace("http://", "https://", 1)
+            if dl.startswith("http://"):
+                dl = "https://" + dl[len("http://"):]
             if size > MAX_BYTES:
                 raise UserError("Video is larger than the Telegram upload limit "
                                 f"({MAX_BYTES // 1048576} MB).")
             name = re.sub(r"[^\w.\- ]", "_", name)[:80] or "video.mp4"
             path, written = out_dir / name, 0
-            async with s.get(dl, headers=_tb_headers("https://www.terabox.com/")) as r:
+            hdrs = _tb_headers("https://www.terabox.com/", cookie=_is_tb_host(dl))
+            async with s.get(dl, headers=hdrs) as r:
                 if r.status != 200:
                     raise UserError(f"TeraBox download failed (HTTP {r.status}).")
                 if int(r.headers.get("Content-Length") or 0) > MAX_BYTES:
@@ -211,6 +237,8 @@ async def download_terabox(url: str, out_dir: Path) -> list[dict]:
                         if written > MAX_BYTES:
                             raise UserError("Video is larger than the Telegram upload limit.")
                         f.write(chunk)
+            if written == 0:
+                raise UserError("TeraBox returned an empty file.")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         raise UserError("Network error while contacting TeraBox. Try again.")
     return [{"path": path, "width": None, "height": None, "duration": None}]
@@ -265,6 +293,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not TB_URL:
+        log.warning("TERABOX_RESOLVER_URL not set: TeraBox relies on the anonymous lookup, "
+                    "which TeraBox often blocks. See README.")
     app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
